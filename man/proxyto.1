@@ -1,0 +1,494 @@
+.TH proxyto 1 "September 2026" "saphira-proxyto" "Saphira Manual"
+.SH NAME
+proxyto \- small generic TCP compatibility proxy for the HAProxy PROXY protocol
+.SH SYNOPSIS
+.B proxyto
+.RB [ \-\-syslog ]
+.I name
+.br
+.B proxyto
+.RB [ \-\-syslog ]
+.B \-c
+.I /path/to/config.conf
+.br
+.B proxyto
+.B \-\-help
+.SH DESCRIPTION
+.B proxyto
+is a small generic TCP compatibility proxy.
+It accepts connections from an upstream proxy speaking the HAProxy PROXY
+protocol version 1 or version 2, removes the PROXY metadata, then makes a
+normal TCP connection to an application which does not understand the PROXY
+protocol and relays the byte stream unchanged in both directions.
+.PP
+For example:
+.PP
+.RS
+.nf
+Internet client
+      |
+    HAProxy
+   PROXY v2
+      |
+    proxyto
+   clean TCP
+      |
+   Geomyidae
+.fi
+.RE
+.PP
+Geomyidae receives ordinary Gopher bytes. It never sees the PROXY header.
+.PP
+.B proxyto
+itself retains the original client metadata and can therefore log the real
+source address.
+.PP
+Although Geomyidae/Gopher is the first use case,
+.B proxyto
+is not specific to Gopher or to HAProxy.
+Any ordinary TCP application that cannot consume PROXY protocol can sit
+behind it. No Gopher-specific, HTTP-specific or TLS-specific code is
+included.
+.SH SAPHIRA LINUX
+Saphira Linux is a small Linux distribution built around
+.BR musl libc ,
+explicit package ownership and conventional Unix system administration.
+It favours small components with clearly defined jobs, ordinary
+configuration files, standard process supervision and infrastructure that
+remains under the operator's control.
+.PP
+Saphira systems are intended to remain understandable from the shell:
+configuration is local, processes are visible, logs are ordinary system
+logs, and services can be assembled from independent components rather
+than requiring an external control plane.
+Configuration and logs remain on systems the operator controls, using
+standard Unix interfaces, ordinary files and processes, and
+operator-controlled infrastructure with no external control plane required.
+.PP
+You run it; you configure it; you can inspect it; it belongs to your
+infrastructure.
+.SH WHY PROXYTO EXISTS
+Many TCP proxies can preserve an original client's IP address by adding a
+PROXY protocol header to the beginning of a connection.
+.PP
+An application which understands PROXY protocol consumes that header and
+uses the enclosed source and destination addresses.
+.PP
+An application which does not understand it instead sees the header as
+application data. For example a connection that should begin with a Gopher
+selector may begin with:
+.PP
+.RS
+.nf
+PROXY TCP4 192.0.2.10 192.0.2.20 43122 70\\r\\n
+.fi
+.RE
+.PP
+For a Gopher server this is interpreted as a Gopher selector and the
+request is therefore wrong. The same class of problem affects any
+protocol that does not expect a prepended metadata line.
+.PP
+.B proxyto
+provides the boundary:
+.PP
+.RS
+.nf
+PROXY-aware infrastructure -> proxyto -> ordinary TCP application
+.fi
+.RE
+.PP
+This avoids carrying application-specific patches merely to teach every
+small TCP daemon about PROXY protocol.
+.SH CONFIGURATION
+.B proxyto
+is normally invoked with a single name:
+.PP
+.RS
+.nf
+proxyto geomyidae
+.fi
+.RE
+.PP
+which loads:
+.PP
+.RS
+.I /etc/saphira/proxyto/geomyidae.conf
+.RE
+.PP
+An explicit path may be used for testing:
+.PP
+.RS
+.nf
+proxyto \-c /path/to/custom.conf
+.fi
+.RE
+.PP
+Configuration is a small key=value file. Lines starting with
+.B #
+or
+.B ;
+are comments. Whitespace around keys and values is trimmed.
+An example:
+.PP
+.RS
+.nf
+application=/usr/bin/geomyidae
+listen=172.16.0.2:70
+proxy=127.0.0.1:70
+.fi
+.RE
+.PP
+.TP
+.B application=
+Descriptive and validation information. The path to the program
+associated with this proxy definition. Currently informational only;
+.B proxyto
+does not start, stop or supervise the program. If the path exists but
+is not executable a warning is logged. OpenRC or systemd owns process
+supervision.
+.TP
+.B listen=
+The exact local IP address and TCP port on which
+.B proxyto
+accepts PROXY-protocol connections. The address is bound exactly as
+written; there is no fallback to
+.B 0.0.0.0 .
+The listener is explicitly a PROXY-protocol listener.
+.TP
+.B proxy=
+The backend TCP destination to which the clean application stream is
+forwarded after the PROXY header has been removed.
+.TP
+.B trusted_proxy=
+Optional comma-separated list of upstream IP addresses that are allowed
+to connect to the
+.B listen
+socket. When set, only peers whose source IP matches an entry are
+accepted; all others are rejected before any PROXY header is processed
+and a message such as
+.I peer=192.0.2.99:54321 rejected (untrusted proxy)
+is logged. When not set, any peer may connect and the listener should
+still be protected by host firewall policy. Up to 32 entries. Each
+entry is a literal IPv4 or IPv6 address, optionally bracketed for
+IPv6, for example:
+.RS
+.nf
+trusted_proxy=203.0.113.10
+trusted_proxy=203.0.113.10, 203.0.113.11
+trusted_proxy=203.0.113.10, [2001:db8::1]
+.fi
+.RE
+.TP
+.B header_timeout=
+Milliseconds to wait for a complete PROXY header before rejecting
+the connection (100..300000, default 5000). Corresponds to haproxy's
+client-side request timeout concept.
+.TP
+.B connect_timeout=
+Milliseconds to wait for the backend TCP connect (100..300000,
+default 5000). Corresponds to haproxy's timeout connect.
+.TP
+.B buffer_size=
+Per-direction relay buffer in bytes (4096..1048576, default 16384,
+matching haproxy's tune.bufsize). Larger pipelined tails that exceed
+it are forwarded by direct write instead of buffering.
+.TP
+.B max_children=
+Maximum concurrent workers (1..4096, default 256). Each accepted
+connection forks; at the cap the daemon refuses new connections
+instead of queueing them, so a peer that can reach the listener cannot
+exhaust PIDs, fds, or memory. Saturation is logged once on entry and
+once on recovery, not once per connection.
+.TP
+.B trusted_proxy=
+Comma-separated list of source addresses permitted to assert an
+identity. May appear only once: a repeated definition is an error
+rather than a silent overwrite. Must be present and non-empty, or the
+daemon refuses to start.
+.TP
+.B service_type=
+Backend service label (1..63 chars of letters, digits and
+.B _ - . + ,
+default
+.BR generic ).
+Used in log lines; reserves the namespace for future per-service
+relay tuning. Examples:
+.BR gopher ,
+.BR postgres ,
+.BR ssh .
+.PP
+Identical port numbers on different addresses are valid, because they
+refer to different sockets:
+.PP
+.RS
+.nf
+listen=172.16.0.2:70
+proxy=127.0.0.1:70
+.fi
+.RE
+.PP
+IPv6 must use brackets to avoid ambiguity between colons in the
+address and the port separator:
+.PP
+.RS
+.nf
+listen=[2a02:8012:bc57:1::10]:70
+proxy=[::1]:70
+.fi
+.RE
+.PP
+Bare IPv6 without brackets (for example
+.I 2a02:8012:bc57:1::10:70
+) is rejected as ambiguous.
+.SH PROXY PROTOCOL
+The implementation follows the vendored and current HAProxy PROXY
+protocol specification
+.RI ( proxy\-protocol.txt ).
+.PP
+Supported:
+.RS
+.IP \(bu 2
+PROXY protocol version 1 (human-readable, single line terminated by CRLF)
+.IP \(bu 2
+PROXY protocol version 2 (binary, with 12-byte signature, version/command,
+family/protocol and 16-bit length)
+.IP \(bu 2
+TCP over IPv4 and TCP over IPv6
+.IP \(bu 2
+.B LOCAL
+and
+.B UNKNOWN
+semantics
+.RE
+.PP
+Other families (for example UNIX sockets or UDP) are accepted and
+skipped via the
+.B UNSPEC
+fallback where applicable, but are not used for TCP relay.
+.PP
+The complete PROXY header is consumed before any application data is
+forwarded. Bytes that arrived in the same segment after the header are
+retained and forwarded as the first payload bytes. Malformed,
+incomplete or unsupported headers cause the connection to be rejected.
+A plain TCP connection sent to a PROXY-only listener is rejected.
+No attempt is made to guess whether PROXY protocol is in use; the
+listener expects it unconditionally. Partial header reads are
+reassembled incrementally with a timeout (see
+.BR header_timeout ),
+including headers arriving in small TCP segments.
+.SH PRIVILEGES
+The daemon starts as root only to bind privileged ports. After the
+listening socket exists it permanently drops to the dedicated
+.B proxyto
+account (supplementary groups, gid, uid, in that order) and verifies
+the drop cannot be regained; any failure is fatal and the daemon
+refuses to continue, never as root and never as a backend
+application's account. All accepted connections and PROXY parsing
+therefore run unprivileged. Started unprivileged (tests, manual
+runs), it logs a notice and continues, there being nothing to drop.
+The runtime account must exist before a privileged start.
+.SH AUTHORITY
+PROXY protocol version 2 can carry Type-Length-Value (TLV) extensions
+after the address block. Type
+.B 0x02
+is
+.BR PP2_TYPE_AUTHORITY .
+It transports a host name or authority value supplied by the upstream
+proxy, as an opaque byte sequence intended to be UTF-8. The common case
+is that this value originates from the TLS Server Name Indication (SNI)
+extension, but the field is more general: the HAProxy specification
+explicitly notes that authority can exist without TLS. Other sources
+include a distinct frontend or virtual IP that statically implies a
+hostname, or explicit load-balancer configuration.
+.PP
+.B proxyto
+v1 parses
+.B PP2_TYPE_AUTHORITY
+when present, validates that it contains no embedded NUL or ASCII
+control characters, retains it as a bounded string suitable for logging
+and future matching, and logs it.
+.PP
+It does not currently:
+.RS
+.IP \(bu 2
+route to different backends based on authority,
+.IP \(bu 2
+inject authority or an invented hostname into the backend byte stream,
+.IP \(bu 2
+invent a hostname where none was supplied.
+.RE
+.PP
+A plain backend such as Geomyidae therefore continues to receive
+untouched Gopher. For version 1 connections, or version 2 connections
+with no AUTHORITY TLV, the configured
+.B proxy=
+destination is used unchanged. Authority-aware routing is reserved for
+a future extension and will not require a protocol change because the
+value is already retained.
+.SH LOGGING
+.B proxyto
+knows the real client address from the PROXY header and logs it.
+.PP
+On connect:
+.PP
+.RS
+.nf
+proxyto[1234]: geomyidae client=[2001:db8::10]:43122 backend=127.0.0.1:70 connected authority=gopher.example
+.fi
+.RE
+.PP
+The
+.I authority=
+field appears only when a v2 AUTHORITY TLV was supplied. Other TLVs
+such as ALPN or UNIQUE_ID may be logged similarly when present.
+.PP
+On close:
+.PP
+.RS
+.nf
+proxyto[1234]: geomyidae client=[2001:db8::10]:43122 closed rx=42 tx=1937
+.fi
+.RE
+.PP
+.I rx
+is the number of payload bytes forwarded from client to backend;
+.I tx
+is the number of bytes forwarded from backend to client. The PROXY
+header itself is not counted.
+.PP
+Logging is to standard error by default, so OpenRC and systemd can
+collect it as ordinary service output. The option
+.B \-\-syslog
+deliberately redirects logging to
+.BR syslog (3)
+instead (facility
+.BR LOG_DAEMON ),
+rather than duplicating every line to both destinations.
+.PP
+Startup and configuration errors are also logged in the same way.
+.SH SECURITY
+PROXY metadata represents trusted upstream information. The
+.B listen
+socket should normally only be reachable by the trusted load balancer or
+proxy, typically enforced by host firewall policy. The
+.B trusted_proxy
+option provides an additional in-application check: when set, the source
+IP of the incoming TCP connection is compared against the listed
+addresses and unlisted peers are rejected before any header is consumed.
+.PP
+.B proxyto
+validates and bounds-checks the header. It rejects malformed,
+truncated, over-long or NUL/control-containing headers and enforces
+field sizes and the 16-bit v2 length. It does not use unbounded string
+functions on header data.
+.PP
+Validation cannot determine whether a claimed source address is
+truthful when an untrusted host can connect directly to the listener.
+Only the upstream's ability to reach the listener should be trusted to
+supply accurate client information.
+.SH LIMITATIONS
+.RS
+.IP \(bu 2
+No TLS termination. No application-protocol parsing.
+.IP \(bu 2
+No transparent source-address spoofing or TPROXY. The backend sees
+.B proxyto
+as its TCP peer (for example
+.IR 127.0.0.1 ).
+The original address is available in
+.B proxyto
+logs.
+.IP \(bu 2
+Authority is logged but does not select backends in v1.
+.IP \(bu 2
+The CRC32C TLV
+.RB ( 0x03 )
+is recognised and skipped but not verified in v1.
+.IP \(bu 2
+SSL TLVs
+.RB ( 0x20
+and subtypes) are recognised and skipped, not interpreted.
+.IP \(bu 2
+No SIGHUP configuration reload. Restart the service to pick up a new
+configuration.
+.IP \(bu 2
+.B proxyto
+does not supervise the backend application.
+.RE
+.SH EXAMPLES
+The first deployment is Geomyidae, which explains the purpose well:
+.PP
+.RS
+.nf
+HAProxy :70
+    send-proxy-v2
+        |
+proxyto 172.16.0.2:70
+        |
+geomyidae 127.0.0.1:70
+.fi
+.RE
+.PP
+HAProxy can retain the original client metadata, proxyto can log it,
+and Geomyidae receives exactly the Gopher request it expects.
+.PP
+Minimal configuration
+.RI ( /etc/saphira/proxyto/geomyidae.conf ):
+.PP
+.RS
+.nf
+application=/usr/bin/geomyidae
+listen=172.16.0.2:70
+proxy=127.0.0.1:70
+# optional allow-list
+# trusted_proxy=203.0.113.10, 203.0.113.11
+.fi
+.RE
+.PP
+Invocation:
+.PP
+.RS
+.nf
+proxyto geomyidae
+.fi
+.RE
+.PP
+Supervision (OpenRC or systemd) starts both
+.B proxyto
+and
+.B geomyidae
+as separate services.
+.SH FILES
+.TP
+.I /etc/saphira/proxyto/*.conf
+Per-service configuration files. The name
+.I geomyidae
+maps to
+.IR geomyidae.conf .
+.TP
+.I /usr/bin/proxyto
+The proxy binary.
+.TP
+.I /usr/share/man/man1/proxyto.1
+This manual page.
+.SH EXIT STATUS
+.TP
+.B 0
+Successful execution. The listener was started. Workers exit 0 on
+clean relay completion.
+.TP
+.B 1
+Configuration, bind or fatal runtime error. Individual connections that
+are rejected or fail to connect to the backend cause the worker to exit
+non-zero, while the listener continues to serve other connections.
+.SH SEE ALSO
+.BR haproxy (1),
+.BR geomyidae (1),
+.BR syslog (3),
+.I proxy-protocol.txt
+(the vendored HAProxy PROXY protocol specification shipped with the
+source)
+.SH AUTHORS
+Saphira Linux.
+Written for Saphira; Geomyidae is the first use case but the program is
+deliberately application-independent.
